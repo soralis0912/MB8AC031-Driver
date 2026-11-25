@@ -32,6 +32,7 @@ extern "C" {
 namespace {
 
 const DWORD CHUNK = 188u * 256u;        // what one GetTsStream hands out
+const ULONGLONG DIONE_SETTLE_MS = 1200;
 const DWORD NO_CHANNEL = 0xFFFFFFFFu;
 
 enum SpaceKind { NUMBERED, BS, CS };
@@ -188,7 +189,7 @@ CBonTuner *g_tuner;
 class CBonTuner final : public IBonDriver2 {
 public:
     CBonTuner() : m_dev(NULL), m_space(NO_CHANNEL), m_channel(NO_CHANNEL),
-                  m_buf(NULL)
+                  m_dioneLocked(0), m_discardUntil(0), m_buf(NULL)
     {
         memset(&m_cfg, 0, sizeof(m_cfg));
         m_cfg.Load();
@@ -244,7 +245,13 @@ public:
     {
         struct mb8_signal s;
 
-        if (m_dev == NULL || m_channel == NO_CHANNEL)
+        if (m_dev == NULL)
+            return 0.0f;
+        // This driver reports a lock flag, not a measured signal level.
+        // Avoid waiting on the GV-M2TV mailbox from TVTest's poll loop.
+        if (mb8_model_of(m_dev)->gen == MB8_GEN_DIONE)
+            return InterlockedCompareExchange(&m_dioneLocked, 0, 0) ? 1.0f : 0.0f;
+        if (m_channel == NO_CHANNEL)
             return 0.0f;
         if (mb8_signal(m_dev, &s) != MB8_OK)
             return 0.0f;
@@ -294,15 +301,21 @@ public:
             *remaining = 0;
         if (m_dev == NULL || m_buf == NULL || !mb8_stream_running(m_dev))
             return FALSE;
+        *dst = m_buf;
+        if (m_discardUntil != 0 && GetTickCount64() >= m_discardUntil) {
+            mb8_stream_purge(m_dev);
+            m_discardUntil = 0;
+        }
         n = mb8_stream_read(m_dev, m_buf, CHUNK, 0);
         if (n < 0) {
             Log("stream: %s", mb8_error(m_dev));
             return FALSE;
         }
-        *dst = m_buf;
-        *size = (DWORD)n;
         if (remaining)
             *remaining = GetReadyCount();
+        if (m_discardUntil != 0)
+            return TRUE;
+        *size = (DWORD)n;
         return TRUE;
     }
 
@@ -356,8 +369,17 @@ public:
             return FALSE;
 
         EnterCriticalSection(&m_lock);
-        // Retuning while the pump runs is safe (frames are serialised),
-        // but the old channel's backlog must not reach the host.
+        // On GV-M2TV, the USB stream pump competes with tuning for the
+        // same mailbox. Stop it first so the channel change can complete.
+        const bool m2tv = mb8_model_of(m_dev)->gen == MB8_GEN_DIONE;
+        if (m2tv)
+            InterlockedExchange(&m_dioneLocked, 0);
+        if (m2tv && mb8_stream_running(m_dev) &&
+            mb8_stream_stop(m_dev) != MB8_OK) {
+            Log("stop before tuning: %s", mb8_error(m_dev));
+            LeaveCriticalSection(&m_lock);
+            return FALSE;
+        }
         rc = mb8_tune_channel(m_dev, &ch, m_cfg.lockWaitMs);
         if (rc < 0) {
             Log("tune %s: %s", name, mb8_error(m_dev));
@@ -366,18 +388,26 @@ public:
         }
         Log("tune %s (%s%u kHz): %s", name, ch.sat ? "IF " : "", ch.khz,
             rc ? "locked" : "no lock");
-        if (!mb8_stream_running(m_dev)) {
+        if ((!m2tv || rc != 0) && !mb8_stream_running(m_dev)) {
             memset(&so, 0, sizeof(so));
             so.buffer_bytes = (size_t)m_cfg.bufferMiB << 20;
+            // A small device ring bounds the previous channel's backlog.
+            if (m2tv)
+                so.ring_mib = 1;
             if (mb8_stream_start(m_dev, &so) != MB8_OK) {
                 Log("stream: %s", mb8_error(m_dev));
                 LeaveCriticalSection(&m_lock);
                 return FALSE;
             }
         }
-        mb8_stream_purge(m_dev);
+        if (mb8_stream_running(m_dev))
+            mb8_stream_purge(m_dev);
         m_space = space;
         m_channel = channel;
+        // Drain data from the previous tune before exposing the new TS.
+        m_discardUntil = m2tv && rc != 0 ? GetTickCount64() + DIONE_SETTLE_MS : 0;
+        if (m2tv)
+            InterlockedExchange(&m_dioneLocked, rc != 0);
         LeaveCriticalSection(&m_lock);
         // A channel with no lock is still "set": the host shows the level
         // and decides.  That is what other BonDrivers do too.
@@ -395,6 +425,7 @@ private:
         mb8_close(m_dev);       // stops the stream (STOP) first
         m_dev = NULL;
         m_space = m_channel = NO_CHANNEL;
+        InterlockedExchange(&m_dioneLocked, 0);
     }
 
     Config m_cfg;
@@ -409,6 +440,8 @@ private:
     DWORD NSp(void) const { return Dt295() ? NSPACES_DT295 : NSPACES; }
 
     DWORD m_space, m_channel;
+    volatile LONG m_dioneLocked;
+    ULONGLONG m_discardUntil;
     BYTE *m_buf;
     wchar_t m_chname[16];
     CRITICAL_SECTION m_lock;
